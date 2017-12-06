@@ -1,0 +1,8 @@
+---
+# handlers for ansible role: certreq
+
+- name: handler for XYZ app
+  debug: 
+    msg: "You called this handler!"
+
+...

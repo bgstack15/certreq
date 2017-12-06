@@ -1,0 +1,19 @@
+---
+# File: /etc/ansible/roles/certreq/main.yml
+# Author: bgstack15
+# Startdate: 2017-09-13
+# Title: Role that Generates a PKCS12 Certificate File From a Microsoft Sub-CA
+# Purpose: Generates a cert from a Microsoft Sub-CA
+# History:
+# Usage:
+# Reference:
+#    /etc/ansible/configuration/test/certreq.yml
+# Improve:
+# Documentation: README.txt
+
+- hosts: all
+  tasks:
+  - include: tasks/main.yml
+  handlers:
+  - include: handlers/main.yml
+...

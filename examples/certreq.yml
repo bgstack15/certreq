@@ -1,0 +1,20 @@
+---
+# File: /etc/ansible/configuration/test/certreq.yml
+# Author: bgstack15
+# Startdate: 2017-11-14
+# Title: Playbook that Deploys The Role certreq
+# Purpose: Wrapper for the certreq role
+# History:
+# Usage:
+#    ansible-playbook -i /etc/ansible/patching/rdu/rdu_patch_list /etc/ansible/configuration/test/certreq.yml --become -u ansible_rdu -l sw*
+#    Use this playbook when you want to assign a new Microsoft CA-signed certificate to a Linux host for SCCM.
+# Reference:
+#    ansible reference online
+# Improve:
+# Document: Below this line
+
+- hosts: all
+  roles:
+  - certreq
+  
+...

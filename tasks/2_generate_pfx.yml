@@ -1,0 +1,29 @@
+---
+# Reference: https://bgstack15.wordpress.com/2016/06/30/manipulating-ssl-certificates/
+
+- name: save private key file as variable
+  shell: warn=no echo "{{ certreq.stdout }}" | awk '/^key:/{print $2;}'
+  register: privatekey
+  failed_when: privatekey.stdout_lines | length != 1
+  changed_when: false
+# privatekey.stdout
+
+- name: save public key file as variable
+  shell: warn=no echo "{{ certreq.stdout }}" | awk '/^certificate:/{print $2;}'
+  register: publickey
+  failed_when: publickey.stdout_lines | length != 1
+  changed_when: false
+# publickey.stdout
+
+- name: save cert chain file as variable
+  shell: warn=no echo "{{ certreq.stdout }}" | awk '/^chain:/{print $2;}'
+  register: chain
+  failed_when: chain.stdout_lines | length != 1
+  changed_when: false
+# chain.stdout
+
+- name: generate pkcs12 file
+  shell: warn=no openssl pkcs12 -export -in "{{ publickey.stdout }}" -inkey "{{ privatekey.stdout }}" -out /tmp/certnew.pfx -CAfile "{{ chain.stdout }}" -certfile "{{ chain.stdout }}" -passin pass:'' -passout pass:''
+  register: pfx
+
+...

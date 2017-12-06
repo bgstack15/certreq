@@ -1,0 +1,5 @@
+domain: prod1.example.com
+ca_host: ca2.prod1.example.com
+ca_user: user
+ca_pass: ExamplePW55*
+ca_template: "ConfigMgrLinuxClientCertificate"

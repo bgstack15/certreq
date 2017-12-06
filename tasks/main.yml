@@ -1,0 +1,9 @@
+---
+- block:
+  #- ping:
+  - include_tasks: 1_certreq.yml
+  - include_tasks: 2_generate_pfx.yml
+  become: yes
+  become_user: root
+  become_method: sudo
+...

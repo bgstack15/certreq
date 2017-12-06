@@ -1,0 +1,41 @@
+---
+# Reference: Use template name, not "template display name" https://social.technet.microsoft.com/Forums/en-US/d5cafc77-3376-43ca-94fd-6b07f7cb193f/using-certutilcertreq-to-get-sccm-client-certs-nondomain-clients?forum=configmgrgeneral
+
+## read in custom variable, based on domain of the host
+- name: read which CA to work with
+  include_vars: "{{ item }}"
+  with_first_found:
+  - '{{ ansible_dns.search[0] }}.yml'
+  - 'prod1.yml'
+  no_log: true
+
+- name: deploy dependencies
+  copy:
+    src: "{{ item.f }}"
+    dest: "/tmp/{{ item.f }}"
+    mode: "{{ item.m }}"
+    owner: root
+    group: root
+  with_items:
+  - { f: 'framework.sh', m: '0755' }
+  - { f: 'certreq.conf', m: '0644' }
+  changed_when: false
+
+- name: request certificate
+  script: certreq.sh -c /tmp/certreq.conf -u "{{ ca_user }}" -p "{{ ca_pass }}" -t "{{ ca_template }}" --ca "{{ ca_host }}"
+  register: certreq
+
+- debug:
+    msg: "{{ certreq }}"
+
+#- pause:
+#    prompt: 'DOES THE ABOVE LOOK OK?...................'
+
+- name: cleanup
+  file:
+    path: "/tmp/{{ item.f }}"
+    state: absent
+  with_items:
+  - { f: 'framework.sh', m: '0755' }
+  - { f: 'certreq.conf', m: '0644' }
+  changed_when: false

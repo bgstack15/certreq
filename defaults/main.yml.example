@@ -1,0 +1,2 @@
+certificate_template: "ConfigMgrLinuxClientCertificate"
+ca_host: 'ca2.ad.example.com'
