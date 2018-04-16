@@ -7,28 +7,30 @@
 # Purpose: Automate host certificate generation in a domain environment
 # Package: ansible role certreq
 # History: 
-#    2017-11-22 Added ca cert chain
+#    2017-11-22 Add ca cert chain
+#    2018-04-16 Add --list and --csr options
 # Usage: in ansible role certreq
 #    Microsoft CA cert templates have permissions on them. A user must be able to "enroll" on the template.
 # Reference: ftemplate.sh 2017-10-10x; framework.sh 2017-10-09a
 #    fundamental curl statements https://stackoverflow.com/questions/31283476/submitting-base64-csr-to-a-microsoft-ca-via-curl/39722983#39722983
 # Improve:
 fiversion="2017-10-10x"
-certreqversion="2017-11-29a"
+certreqversion="2018-04-16a"
 
 usage() {
    less -F >&2 <<ENDUSAGE
-usage: certreq.sh [-dhV] [-u username] [-p password] [-w tempdir] [-t template] [--cn CN] [--ca <CA hostname>]
+usage: certreq.sh [-dhV] [-u username] [-p password] [-w tempdir] [-t template] [--cn CN] [--ca <CA hostname>] [-l|-g]
 version ${certreqversion}
  -d debug   Show debugging info, including parsed variables.
  -h usage   Show this usage block.
  -V version Show script version number.
  -u username User to connect via ntlm to CA. Can be "username" or "domain\\username"
  -p password
- -w workdir  Temp directory to work in. Default is a (mktemp -d).
+ -w workdir  Temp directory to work in. Default is \$(mktemp -d).
  -t template Template to request from CA. Default is "ConfigMgrLinuxClientCertificate"
- --cn        CN to request. Default is the \$( hostname -f )
+ --cn        CN to request. Default is \$( hostname -f )
  --ca        CA hostname or base URL. Example: ca2.example.com
+ --list      Action: list available templates and exit.
 Return values under 1000: A non-zero value is the sum of the items listed here:
  0 Everything worked
  1 Cert file is still a CSR
@@ -46,6 +48,200 @@ ENDUSAGE
 }
 
 # DEFINE FUNCTIONS
+
+openssl_req() {
+   # call: openssl-req "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}"
+   # outputs:
+   #    vars: ${CERT} ${DATA} ${CERTATTRIB}
+   #    files: ${CERTREQ_WORKDIR}/${this_filename}.crt ${CERTREQ_WORKDIR}/${thisfilename}.key
+
+   local this_filename="${1}"
+   local this_subject="${2}"
+   
+   openssl req -new -nodes \
+      -out "${CERTREQ_WORKDIR}/${this_filename}.crt" \
+      -keyout "${CERTREQ_WORKDIR}/${this_filename}.key" \
+      -subj "${this_subject}"
+   CERT="$( cat "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" | tr -d '\n\r' )"
+   DATA="Mode=newreq&CertRequest=${CERT}&C&TargetStoreFlags=0&SaveCert=yes"
+   CERT="$( echo ${CERT} | sed -e 's/+/%2B/g' | tr -s ' ' '+' )"
+   CERTATTRIB="CertificateTemplate:${CERTREQ_TEMPLATE}"
+
+}
+
+submit_csr() {
+   # call: submit_csr "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERT}" "${CERTATTRIB}"
+   # outputs: ${CERTLINK}
+
+   local this_user_string="${1}"
+   local this_ca="${2}"
+   local this_ca_host="${3}"
+   local this_cert="${4}"
+   local this_cert_attrib="${5}"
+
+   OUTPUTLINK="$( curl -k -u "${this_user_string}" --ntlm \
+      "${this_ca}/certsrv/certfnsh.asp" \
+      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Encoding: gzip, deflate' \
+      -H 'Accept-Language: en-US,en;q=0.5' \
+      -H 'Connection: keep-alive' \
+      -H "Host: ${this_ca_host}" \
+      -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --data "Mode=newreq&CertRequest=${this_cert}&CertAttrib=${CERTATTRIB}&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" | grep -A 1 'function handleGetCert() {' | tail -n 1 | cut -d '"' -f 2 )"
+   CERTLINK="${this_ca}/certsrv/${OUTPUTLINK}"
+
+}
+
+fetch_signed_cert() {
+   # call: fetch_signed_cert "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTLINK}" "${CERTREQ_CNPARAM}"
+   # output:
+   #    vars: ${finaloutput}
+   #    files: ${CERTREQ_WORKDIR}/${this_filename}.crt
+
+   local this_user_string="${1}"
+   local this_ca="${2}"
+   local this_ca_host="${3}"
+   local this_certlink="${4}"
+   local this_filename="${5}"
+
+   curl -k -u "${this_user_string}" --ntlm "${this_certlink}" \
+      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Encoding: gzip, deflate' \
+      -H 'Accept-Language: en-US,en;q=0.5' \
+      -H 'Connection: keep-alive' \
+      -H "Host: ${this_ca_host}" \
+      -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+      -H 'Content-Type: application/x-www-form-urlencoded' > "${CERTREQ_WORKDIR}/${this_filename}.crt"
+   finaloutput=$?
+
+}
+
+get_number_of_current_ca_cert() {
+   # call: get_number_of_current_ca_cert "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
+   # outputs: ${CURRENTNUM}
+
+   local this_user_string="${1}"
+   local this_ca="${2}"
+   local this_ca_host="${3}"
+
+   RESPONSE="$( curl -s -k -u "${this_user_string}" --ntlm \
+      "${this_ca}/certsrv/certcarc.asp" \
+      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Encoding: gzip, deflate' \
+      -H 'Accept-Language: en-US,en;q=0.5' \
+      -H 'Connection: keep-alive' \
+      -H "Host: ${this_ca_host}" \
+      -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+      -H 'Content-Type: application/x-www-form-urlencoded' )"
+   CURRENTNUM="$( echo "${RESPONSE}" | grep -cE 'Option' )"
+
+}
+
+get_latest_ca_cert_chain() {
+   # call: get_latest_ca_cert_chain "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CURRENTNUM}"
+   # outputs:
+   #    files: ${CHAIN_FILE}
+
+   local this_user_string="${1}"
+   local this_ca="${2}"
+   local this_ca_host="${3}"
+   local this_num="${4}"
+
+   CURRENT_P7B="$( curl -s -k -u "${this_user_string}" --ntlm \
+      "${this_ca}/certsrv/certnew.p7b?ReqID=CACert&Renewal=${this_num}" \
+      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Encoding: gzip, deflate' \
+      -H 'Accept-Language: en-US,en;q=0.5' \
+      -H 'Connection: keep-alive' \
+      -H "Host: ${this_ca_host}" \
+      -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+      -H 'Content-Type: application/x-www-form-urlencoded' )"
+
+   # CONVERT TO PEM
+   echo "${CURRENT_P7B}" | openssl pkcs7 -print_certs -out "${CERTREQ_TEMPFILE}"
+
+   # RENAME TO PROPER FILENAME
+   # will read only the first cert, so get domain of issuer of it.
+   CA_DOMAIN="$( openssl x509 -in "${CERTREQ_TEMPFILE}" -noout -issuer 2>&1 | sed -r -e 's/^.*CN=[A-Za-z0-9]+\.//;' )"
+   CHAIN_FILE="chain-${CA_DOMAIN}.crt"
+   mv -f "${CERTREQ_TEMPFILE}" "${CERTREQ_WORKDIR}/${CHAIN_FILE}" 1>/dev/null 2>&1
+
+}
+
+action_get_cert() {
+   # call: action_get_cert "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
+   # outputs:
+   #   vars: ${finaloutput}
+   #   files: ${CHAIN_FILE} ${CERTREQ_CNPARAM}.crt and .key and 
+
+   local this_cnparam="${1}"
+   local this_subject="${2}"
+   local this_user_string="${3}"
+   local this_ca="${4}"
+   local this_ca_host="${5}"
+
+   # GENERATE PRIVATE KEY
+   openssl_req "${this_cnparam}" "${this_subject}"
+   debuglev 1 && {
+      # DELETEME
+      echo "CERT=${CERT}"
+      echo "DATA=${DATA}"
+      echo "CERTATTRIB=${CERTATTRIB}"
+   } 
+
+   # SUBMIT CERTIFICATE SIGNING REQUEST 
+   submit_csr "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CERT}" "${CERTATTRIB}"
+   debuglev 1 && {
+      # DELETEME
+      echo "CERTLINK=${CERTLINK}"
+   }
+
+   # FETCH SIGNED CERTIFICATE
+   fetch_signed_cert "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CERTLINK}" "${this_cnparam}"
+   debuglev 1 && {
+      echo "finaloutput=${finaloutput}"
+   }
+
+   # GET NUMBER OF CURRENT CA CERT
+   get_number_of_current_ca_cert "${this_user_string}" "${this_ca}" "${this_ca_host}"
+   debuglev 1 && {
+      echo "CURRENTNUM=${CURRENTNUM}"
+   }
+
+   # GET LATEST CA CERT CHAIN
+   get_latest_ca_cert_chain "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CURRENTNUM}"
+   debuglev 1 && {
+      echo "CHAIN_FILE=${CHAIN_FILE}"
+   }
+
+}
+
+action_list_templates() {
+   # call: action_list_templates "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
+   
+   local this_user_string="${1}"
+   local this_ca="${2}"
+   local this_ca_host="${3}"
+
+   RESPONSE="$( curl -s -k -u "${this_user_string}" --ntlm \
+      "${this_ca}/certsrv/certrqxt.asp" \
+      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Encoding: gzip, deflate' \
+      -H 'Accept-Language: en-US,en;q=0.5' \
+      -H 'Connection: keep-alive' \
+      -H "Host: ${this_ca_host}" \
+      -H "Referer: ${this_ca}/certsrv/certrqus.asp" \
+      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+      -H 'Content-Type: application/x-www-form-urlencoded' )"
+   AVAILABLE_TEMPLATES="$( echo "${RESPONSE}" | grep -E -- "<Option" | grep -oE "Value=\".*\">" |awk -F';' -v 'a=0' 'BEGIN{OFS=","} {a=a+1; print a,$2,$14}' | sed -r -e 's/">\s*$//;' )"
+   # goal: set a variable of the items, probably comma-delimited
+
+}
 
 # DEFINE TRAPS
 
@@ -90,6 +286,8 @@ parseFlag() {
       "ca" | "certauthority" | "cauthority" ) getval; CERTREQ_CAPARAM="${tempval}";;
       "c" | "conf" | "conffile" | "config" ) getval; conffile="${tempval}";;
       "nc" | "nocleanup" ) CR_NC=1;;
+      "l" | "list" ) CERTREQ_ACTION="list";;
+      "g" | "generate" ) CERTREQ_ACTION="generate";;
    esac
    
    debuglev 10 && { test ${hasval} -eq 1 && ferror "flag: ${flag} = ${tempval}" || ferror "flag: ${flag}"; }
@@ -182,6 +380,7 @@ define_if_new CERTREQ_CNSHORT "$( echo "${CERTREQ_CNLONG%%.*}" )"
 define_if_new CERTREQ_CLEANUP_SEC 300
 logfile="$( TMPDIR="${CERTREQ_WORKDIR}" mktemp -t tmp.XXXXXXXXXX )"
 CERTREQ_TEMPFILE="$( TMPDIR="${CERTREQ_WORKDIR}" mktemp -t tmp.XXXXXXXXXX )"
+define_if_new CERTREQ_ACTION "generate"
 
 # calculate the subject
 if test -n "${CERTREQ_CNPARAM}";
@@ -238,99 +437,50 @@ debuglev 5 && {
 
 # MAIN LOOP
 {
-   # GENERATE PRIVATE KEY
-   openssl req -new -nodes \
-      -out "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" \
-      -keyout "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key" \
-      -subj "${CERTREQ_SUBJECT}"
-   CERT="$( cat "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" | tr -d '\n\r' )"
-   DATA="Mode=newreq&CertRequest=${CERT}&C&TargetStoreFlags=0&SaveCert=yes"
-   CERT="$( echo ${CERT} | sed -e 's/+/%2B/g' | tr -s ' ' '+' )"
-   CERTATTRIB="CertificateTemplate:${CERTREQ_TEMPLATE}"
 
-   # SUBMIT CERTIFICATE SIGNING REQUEST 
-   OUTPUTLINK="$( curl -k -u "${CERTREQ_USER}:${CERTREQ_PASS}" --ntlm \
-      "${CERTREQ_CA}/certsrv/certfnsh.asp" \
-      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Encoding: gzip, deflate' \
-      -H 'Accept-Language: en-US,en;q=0.5' \
-      -H 'Connection: keep-alive' \
-      -H "Host: ${CERTREQ_CAHOST}" \
-      -H "Referer: ${CERTREQ_CA}/certsrv/certrqxt.asp" \
-      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
-      -H 'Content-Type: application/x-www-form-urlencoded' \
-      --data "Mode=newreq&CertRequest=${CERT}&CertAttrib=${CERTATTRIB}&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" | grep -A 1 'function handleGetCert() {' | tail -n 1 | cut -d '"' -f 2 )"
-   CERTLINK="${CERTREQ_CA}/certsrv/${OUTPUTLINK}"
-
-   # FETCH SIGNED CERTIFICATE
-   curl -k -u "${CERTREQ_USER}:${CERTREQ_PASS}" --ntlm $CERTLINK \
-      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Encoding: gzip, deflate' \
-      -H 'Accept-Language: en-US,en;q=0.5' \
-      -H 'Connection: keep-alive' \
-      -H "Host: ${CERTREQ_CAHOST}" \
-      -H "Referer: ${CERTREQ_CA}/certsrv/certrqxt.asp" \
-      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
-      -H 'Content-Type: application/x-www-form-urlencoded' > "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
-   finaloutput=$?
-
-   # GET NUMBER OF CURRENT CA CERT
-   RESPONSE="$( curl -s -k -u "${CERTREQ_USER}:${CERTREQ_PASS}" --ntlm \
-      "${CERTREQ_CA}/certsrv/certcarc.asp" \
-      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Encoding: gzip, deflate' \
-      -H 'Accept-Language: en-US,en;q=0.5' \
-      -H 'Connection: keep-alive' \
-      -H "Host: ${CERTREQ_CAHOST}" \
-      -H "Referer: ${CERTREQ_CA}/certsrv/certrqxt.asp" \
-      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
-      -H 'Content-Type: application/x-www-form-urlencoded' )"
-   CURRENTNUM="$( echo "${RESPONSE}" | grep -cE 'Option' )"
-
-   # GET LATEST CA CERT CHAIN
-   CURRENT_P7B="$( curl -s -k -u "${CERTREQ_USER}:${CERTREQ_PASS}" --ntlm \
-      "${CERTREQ_CA}/certsrv/certnew.p7b?ReqID=CACert&Renewal=${CURRENTNUM}" \
-      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Encoding: gzip, deflate' \
-      -H 'Accept-Language: en-US,en;q=0.5' \
-      -H 'Connection: keep-alive' \
-      -H "Host: ${CERTREQ_CAHOST}" \
-      -H "Referer: ${CERTREQ_CA}/certsrv/certrqxt.asp" \
-      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
-      -H 'Content-Type: application/x-www-form-urlencoded' )"
-
-   # CONVERT TO PEM
-   echo "${CURRENT_P7B}" | openssl pkcs7 -print_certs -out "${CERTREQ_TEMPFILE}"
-
-   # RENAME TO PROPER FILENAME
-   # will read only the first cert, so get domain of issuer of it.
-   CA_DOMAIN="$( openssl x509 -in "${CERTREQ_TEMPFILE}" -noout -issuer 2>&1 | sed -r -e 's/^.*CN=[A-Za-z0-9]+\.//;' )"
-   CHAIN_FILE="chain-${CA_DOMAIN}.crt"
-   mv -f "${CERTREQ_TEMPFILE}" "${CERTREQ_WORKDIR}/${CHAIN_FILE}" 1>/dev/null 2>&1
+   case "${CERTREQ_ACTION}" in
+      list)
+         action_list_templates "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
+         ;;
+      *)
+         # default action
+         action_get_cert "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
+         # CHECK EVERYTHING
+         failed=0
+         openssloutput="$( openssl x509 -in "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" -noout -subject -issuer -startdate -enddate 2>/dev/null )"
+         grep -qE -- 'REQUEST--' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" && failed=$(( failed + 1 ))
+         grep -qiE '\<\/?body\>' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" && failed=$(( failed + 2 ))
+         test ${finaloutput} -ne 0 && failed=$(( failed + 4 ))
+         grep -qE -- '--END CERTIFICATE--' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" || failed=$(( failed + 8 ))
+         #echo "${openssloutput}" | grep -qE "subject.*${CERTREQ_SUBJECT}" || failed=$(( failed + 16 ))
+         echo "${openssloutput}" | grep -qE "issuer.*" || failed=$(( failed + 16 ))
+         ;;
+   esac
 
 } 1> ${logfile} 2>&1
 
-# CHECK EVERYTHING
-failed=0
-openssloutput="$( openssl x509 -in "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" -noout -subject -issuer -startdate -enddate 2>/dev/null )"
-grep -qE -- 'REQUEST--' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" && failed=$(( failed + 1 ))
-grep -qiE '\<\/?body\>' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" && failed=$(( failed + 2 ))
-test ${finaloutput} -ne 0 && failed=$(( failed + 4 ))
-grep -qE -- '--END CERTIFICATE--' "${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt" || failed=$(( failed + 8 ))
-#echo "${openssloutput}" | grep -qE "subject.*${CERTREQ_SUBJECT}" || failed=$(( failed + 16 ))
-echo "${openssloutput}" | grep -qE "issuer.*" || failed=$(( failed + 16 ))
+case "${CERTREQ_ACTION}" in
+   list)
+      # echo the variable from action_list_templates
+      echo "${AVAILABLE_TEMPLATES}"
+      ;;
+   *)
+      # for generate and generate-csr and everything else really
 
-# if everything was successful, display information below
-#if test ${failed} -eq 0;
-#then
-   echo "workdir: ${CERTREQ_WORKDIR}"
-   echo "logfile: ${logfile}"
-   echo "certificate: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
-   echo "key: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key"
-   echo "chain: ${CERTREQ_WORKDIR}/${CHAIN_FILE}"
-#fi
-clean_certreq
-exit "${failed}"
+      # if everything was successful, display information below
+      #if test ${failed} -eq 0;
+      #then
+         echo "workdir: ${CERTREQ_WORKDIR}"
+         echo "logfile: ${logfile}"
+         echo "certificate: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
+         echo "key: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key"
+         echo "chain: ${CERTREQ_WORKDIR}/${CHAIN_FILE}"
+      #fi
+      clean_certreq
+      exit "${failed:-0}"
+      ;;
+
+esac
 
 # EMAIL LOGFILE
 #${sendsh} ${sendopts} "${server} ${scriptfile} out" ${logfile} ${interestedparties}
