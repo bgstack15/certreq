@@ -9,17 +9,18 @@
 # History: 
 #    2017-11-22 Add ca cert chain
 #    2018-04-16 Add --list and --csr options
+#    2018-05-07 Add actions for using a CA with manually-approved certs
 # Usage: in ansible role certreq
 #    Microsoft CA cert templates have permissions on them. A user must be able to "enroll" on the template.
 # Reference: ftemplate.sh 2017-10-10x; framework.sh 2017-10-09a
 #    fundamental curl statements https://stackoverflow.com/questions/31283476/submitting-base64-csr-to-a-microsoft-ca-via-curl/39722983#39722983
 # Improve:
 fiversion="2017-10-10x"
-certreqversion="2018-04-16b"
+certreqversion="2018-05-07a"
 
 usage() {
    less -F >&2 <<ENDUSAGE
-usage: certreq.sh [-dhV] [-u username] [-p password] [-w tempdir] [-t template] [--cn CN] [--ca <CA hostname>] [-l|-g] [--csr /path/to/file]
+usage: certreq.sh [-dhV] [-u username] [-p password] [-w tempdir] [-t template] [--cn CN] [--ca <CA hostname>] [-l|-g] [--list|--csr /path/to/file|--fetch|--request] [--no-ca] [--reqid <reqid_string>]
 version ${certreqversion}
  -d debug   Show debugging info, including parsed variables.
  -h usage   Show this usage block.
@@ -30,8 +31,13 @@ version ${certreqversion}
  -t template Template to request from CA. Default is "ConfigMgrLinuxClientCertificate"
  --cn        CN to request. Default is \$( hostname -f )
  --ca        CA hostname or base URL. Example: ca2.example.com
- --list      Action: list available templates and exit.
+ --reqid <value>  Request ID. Needed by --fetch action.
+ --no-ca     Skip downloading the CA cert chain.
+ACTIONS:
+ --list      list available templates and exit.
  --csr filename Provide a .csr file instead of making a new csr. Accepts "stdin" to read from standard in.
+ --fetch     Only retrieve a cert that was previously requested. Requires CERTREQ_REQID or --reqid.
+ --request   Only request a cert. Use if the cert needs to be approved manually by an admin on the server.
 Return values under 1000: A non-zero value is the sum of the items listed here:
  0 Everything worked
  1 Cert file is still a CSR
@@ -45,15 +51,16 @@ Return values above 1000:
 1003 Incorrect OS type
 1004 Unable to find dependency
 1005 Not run as root or sudo
+1006 Input is invalid
 ENDUSAGE
 }
 
 # DEFINE FUNCTIONS
 
 openssl_req() {
-   # call: openssl-req "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_ACTION}" "${CERTREQ_CSR}"
+   # call: openssl_req "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_ACTION}" "${CERTREQ_CSR}"
    # outputs:
-   #    vars: ${CERT} ${DATA} ${CERTATTRIB}
+   #    vars: ${CSR} ${DATA} ${CERTATTRIB}
    #    files: ${CERTREQ_WORKDIR}/${this_filename}.crt ${CERTREQ_WORKDIR}/${thisfilename}.key
 
    local this_filename="${1}"
@@ -63,34 +70,38 @@ openssl_req() {
    
    debuglev 8 && echo "Action ${this_action}"
    case "${this_action}" in
-      generate-csr)
+      *-csr)
          case "${this_csr}" in
             stdin)
-               cat - > "${CERTREQ_WORKDIR}/${this_filename}.crt"
+               cat - > "${CERTREQ_WORKDIR}/${this_filename}.csr"
                ;;
             *)
-               # assume it is a file
-               cat "${this_csr}" > "${CERTREQ_WORKDIR}/${this_filename}.crt"
+               # make sure file exists
+               if ! test -e "${this_csr}" ;
+               then
+                  ferror "${scriptfile}: 1006. CSR file ${this_csr} is invalid or not found. Aborted." && exit 1006
+               fi
+               cat "${this_csr}" > "${CERTREQ_WORKDIR}/${this_filename}.csr"
                ;;
          esac
          ;;
-      generate)
+      *)
          openssl req -new -nodes \
-            -out "${CERTREQ_WORKDIR}/${this_filename}.crt" \
+            -out "${CERTREQ_WORKDIR}/${this_filename}.csr" \
             -keyout "${CERTREQ_WORKDIR}/${this_filename}.key" \
             -subj "${this_subject}"
          ;;
    esac
 
-   CERT="$( cat "${CERTREQ_WORKDIR}/${this_filename}.crt" | tr -d '\n\r' )"
-   DATA="Mode=newreq&CertRequest=${CERT}&C&TargetStoreFlags=0&SaveCert=yes"
-   CERT="$( echo ${CERT} | sed -e 's/+/%2B/g' | tr -s ' ' '+' )"
+   CSR="$( cat "${CERTREQ_WORKDIR}/${this_filename}.csr" | tr -d '\n\r' )"
+   DATA="Mode=newreq&CertRequest=${CSR}&C&TargetStoreFlags=0&SaveCert=yes"
+   CSR="$( echo ${CSR} | sed -e 's/+/%2B/g' | tr -s ' ' '+' )"
    CERTATTRIB="CertificateTemplate:${CERTREQ_TEMPLATE}"
 
 }
 
 submit_csr() {
-   # call: submit_csr "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERT}" "${CERTATTRIB}"
+   # call: submit_csr "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CSR}" "${CERTATTRIB}" "${CERTREQ_ACTION}"
    # outputs: ${CERTLINK}
 
    local this_user_string="${1}"
@@ -98,25 +109,49 @@ submit_csr() {
    local this_ca_host="${3}"
    local this_cert="${4}"
    local this_cert_attrib="${5}"
+   local this_action="${6}"
 
-   FULLPAGE="$( curl -k -u "${this_user_string}" --ntlm \
-      "${this_ca}/certsrv/certfnsh.asp" \
-      -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Encoding: gzip, deflate' \
-      -H 'Accept-Language: en-US,en;q=0.5' \
-      -H 'Connection: keep-alive' \
-      -H "Host: ${this_ca_host}" \
-      -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
-      -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
-      -H 'Content-Type: application/x-www-form-urlencoded' \
-      --data "Mode=newreq&CertRequest=${this_cert}&CertAttrib=${CERTATTRIB}&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" )" 
-   OUTPUTLINK="$( echo "${FULLPAGE}" | grep -A 1 'function handleGetCert() {' | tail -n 1 | cut -d '"' -f 2 )"
-   CERTLINK="${this_ca}/certsrv/${OUTPUTLINK}"
+   case "${this_action}" in
+
+      request)
+         # request-only
+         REQUESTID="$( curl -k -u "${this_user_string}" --ntlm \
+            "${this_ca}/certsrv/certfnsh.asp" \
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+            -H 'Accept-Encoding: gzip, deflate' \
+            -H 'Accept-Language: en-US,en;q=0.5' \
+            -H 'Connection: keep-alive' \
+            -H "Host: ${this_ca_host}" \
+            -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data "Mode=newreq&CertRequest=${this_cert}&CertAttrib=${this_cert_attrib}&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" | grep "' nReqId" | awk -F'= ' '{print $2}' | sed -e 's/\r//g' )"
+         CERTLINK="${CERTREQ_CA}/certsrv/certnew.cer?ReqID=${REQUESTID}"
+         
+         ;;
+
+      *)
+         FULLPAGE="$( curl -k -u "${this_user_string}" --ntlm \
+            "${this_ca}/certsrv/certfnsh.asp" \
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+            -H 'Accept-Encoding: gzip, deflate' \
+            -H 'Accept-Language: en-US,en;q=0.5' \
+            -H 'Connection: keep-alive' \
+            -H "Host: ${this_ca_host}" \
+            -H "Referer: ${this_ca}/certsrv/certrqxt.asp" \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data "Mode=newreq&CertRequest=${this_cert}&CertAttrib=${this_cert_attrib}&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" )" 
+         OUTPUTLINK="$( echo "${FULLPAGE}" | grep -A 1 'function handleGetCert() {' | tail -n 1 | cut -d '"' -f 2 )"
+         CERTLINK="${this_ca}/certsrv/${OUTPUTLINK}"
+         ;;
+
+   esac
 
 }
 
 fetch_signed_cert() {
-   # call: fetch_signed_cert "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTLINK}" "${CERTREQ_CNPARAM}"
+   # call: fetch_signed_cert "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTLINK}" "${CERTREQ_CNPARAM}" "${CERTREQ_ACTION}" "${CERTREQ_REQID}"
    # output:
    #    vars: ${finaloutput}
    #    files: ${CERTREQ_WORKDIR}/${this_filename}.crt
@@ -126,6 +161,22 @@ fetch_signed_cert() {
    local this_ca_host="${3}"
    local this_certlink="${4}"
    local this_filename="${5}"
+   local this_action="${6}"
+   local this_reqid="${7}"
+
+   case "${this_action}" in
+      fetch)
+         if test -z "${this_reqid}" ;
+         then
+            ferror "${scriptfile}: 1006. For --fetch, please provide --reqid REQID. Aborted."
+            exit 1006
+         fi
+         this_certlink="${CERTREQ_CA}/certsrv/certnew.cer?ReqID=${this_reqid}"
+         ;;
+      *)
+         :
+         ;;
+   esac
 
    curl -k -u "${this_user_string}" --ntlm "${this_certlink}" \
       -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
@@ -211,13 +262,13 @@ action_get_cert() {
    # GENERATE PRIVATE KEY
    openssl_req "${this_cnparam}" "${this_subject}" "${this_action}" "${this_csr}"
    debuglev 8 && {
-      echo "CERT=${CERT}"
+      echo "CSR=${CSR}"
       echo "DATA=${DATA}"
       echo "CERTATTRIB=${CERTATTRIB}"
    } 
 
    # SUBMIT CERTIFICATE SIGNING REQUEST 
-   submit_csr "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CERT}" "${CERTATTRIB}"
+   submit_csr "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CSR}" "${CERTATTRIB}" "${this_action}"
    debuglev 8 && {
       echo "FULLPAGE=${FULLPAGE}"
       echo "OUTPUTLINK=${OUTPUTLINK}"
@@ -225,22 +276,90 @@ action_get_cert() {
    }
 
    # FETCH SIGNED CERTIFICATE
-   fetch_signed_cert "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CERTLINK}" "${this_cnparam}"
+   fetch_signed_cert "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CERTLINK}" "${this_cnparam}" "${this_action}" "REQID-not-needed-for-this-action"
    debuglev 8 && {
       echo "finaloutput=${finaloutput}"
    }
 
-   # GET NUMBER OF CURRENT CA CERT
-   get_number_of_current_ca_cert "${this_user_string}" "${this_ca}" "${this_ca_host}"
+   if ! fistruthy "${CERTREQ_SKIP_CACERTS}" ;
+   then
+
+      # GET NUMBER OF CURRENT CA CERT
+      get_number_of_current_ca_cert "${this_user_string}" "${this_ca}" "${this_ca_host}"
+      debuglev 8 && {
+         echo "CURRENTNUM=${CURRENTNUM}"
+      }
+
+      # GET LATEST CA CERT CHAIN
+      get_latest_ca_cert_chain "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CURRENTNUM}"
+      debuglev 8 && {
+         echo "CHAIN_FILE=${CHAIN_FILE}"
+      }
+
+   fi
+
+}
+
+action_request() {
+   # call: action_request "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTREQ_ACTION}" "${CERTREQ_CSR}"
+
+   local this_cnparam="${1}"
+   local this_subject="${2}"
+   local this_user_string="${3}"
+   local this_ca="${4}"
+   local this_ca_host="${5}"
+   local this_action="${6}"
+   local this_csr="${7}"
+
+   # GENERATE PRIVATE KEY
+   openssl_req "${this_cnparam}" "${this_subject}" "${this_action}" "${this_csr}"
    debuglev 8 && {
-      echo "CURRENTNUM=${CURRENTNUM}"
+      echo "CSR=${CSR}"
+      echo "DATA=${DATA}"
+      echo "CERTATTRIB=${CERTATTRIB}"
+   } 
+
+   # SUBMIT CERTIFICATE SIGNING REQUEST 
+   submit_csr "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CSR}" "${CERTATTRIB}" "${this_action}"
+   debuglev 8 && {
+      echo "FULLPAGE=${FULLPAGE}"
+      echo "OUTPUTLINK=${OUTPUTLINK}"
+      echo "CERTLINK=${CERTLINK}"
+   }
+         
+}
+
+action_fetch() {
+   # call: action_fetch "${CERTREQ_CNPARAM}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTREQ_ACTION}" "${CERTREQ_REQID}"
+
+   local this_cnparam="${1}"
+   local this_user_string="${2}"
+   local this_ca="${3}"
+   local this_ca_host="${4}"
+   local this_action="${5}"
+   local this_reqid="${6}"
+
+   fetch_signed_cert "${this_user_string}" "${this_ca}" "${this_ca_host}" "WILL-BE-REPLACED" "${this_cnparam}" "${this_action}" "${this_reqid}"
+   debuglev 8 && {
+      echo "finaloutput=${finaloutput}"
    }
 
-   # GET LATEST CA CERT CHAIN
-   get_latest_ca_cert_chain "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CURRENTNUM}"
-   debuglev 8 && {
-      echo "CHAIN_FILE=${CHAIN_FILE}"
-   }
+   if ! fistruthy "${CERTREQ_SKIP_CACERTS}" ;
+   then
+
+      # GET NUMBER OF CURRENT CA CERT
+      get_number_of_current_ca_cert "${this_user_string}" "${this_ca}" "${this_ca_host}"
+      debuglev 8 && {
+         echo "CURRENTNUM=${CURRENTNUM}"
+      }
+
+      # GET LATEST CA CERT CHAIN
+      get_latest_ca_cert_chain "${this_user_string}" "${this_ca}" "${this_ca_host}" "${CURRENTNUM}"
+      debuglev 8 && {
+         echo "CHAIN_FILE=${CHAIN_FILE}"
+      }
+
+   fi
 
 }
 
@@ -274,9 +393,8 @@ clean_certreq() {
    if test -z "${CR_NC}";
    then
       nohup /bin/bash <<EOF 1>/dev/null 2>&1 &
-sleep "${CERTREQ_CLEANUP_SEC:-300}" ; /bin/rm -r "${CERTREQ_WORKDIR}" 2>/dev/null ;
+sleep "${CERTREQ_CLEANUP_SEC:-300}" ; /bin/rm -r "${CERTREQ_WORKDIR:-NOTHINGTODELETE}" 2>/dev/null ;
 EOF
-#sleep "${CERTREQ_CLEANUP_SEC:-300}" ; /bin/rm -r "${CERTREQ_WORKDIR}" 2>/dev/null ; echo "slash-dollar-0=\"\$0\"  slash-slash-dollar-0=\"\\$0\"" > /dev/pts/2 ;
    fi
 
 }
@@ -311,7 +429,11 @@ parseFlag() {
       "nc" | "nocleanup" ) CR_NC=1;;
       "l" | "list" ) CERTREQ_ACTION="list";;
       "g" | "generate" ) CERTREQ_ACTION="generate";;
-      "csr" ) CERTREQ_ACTION="generate-csr"; getval; CERTREQ_CSR="${tempval}" ;;
+      "csr" ) CERTREQ_ACTION="${CERTREQ_ACTION:-generate}-csr"; getval; CERTREQ_CSR="${tempval}" ;;
+      "fetch" | "fetch-only" ) CERTREQ_ACTION="fetch";;
+      "request" | "request-only" ) CERTREQ_ACTION="request";;
+      "no-ca" | "noca" ) CERTREQ_SKIP_CACERTS=1;;
+      "req" | "reqid" | "req-id" | "request" | "requestid" | "request-id" ) getval; CERTREQ_REQID="${tempval}";;
    esac
    
    debuglev 10 && { test ${hasval} -eq 1 && ferror "flag: ${flag} = ${tempval}" || ferror "flag: ${flag}"; }
@@ -463,11 +585,24 @@ debuglev 5 && {
 {
 
    case "${CERTREQ_ACTION}" in
+
       list)
          action_list_templates "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}"
          ;;
+      
+      request)
+         # alias of "request-only"
+         action_request "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTREQ_ACTION}" "${CERTREQ_CSR}"
+         ;;
+
+      fetch)
+         # alias of "fetch-only"
+         action_fetch "${CERTREQ_CNPARAM}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTREQ_ACTION}" "${CERTREQ_REQID}"
+         ;;
+
       *)
-         # default action
+         # default action="generate"
+         # also catches "generate-csr"
          action_get_cert "${CERTREQ_CNPARAM}" "${CERTREQ_SUBJECT}" "${CERTREQ_USER}:${CERTREQ_PASS}" "${CERTREQ_CA}" "${CERTREQ_CAHOST}" "${CERTREQ_ACTION}" "${CERTREQ_CSR}"
          # CHECK EVERYTHING
          failed=0
@@ -484,27 +619,42 @@ debuglev 5 && {
 } 1> ${logfile} 2>&1
 
 case "${CERTREQ_ACTION}" in
+
    list)
       # echo the variable from action_list_templates
       echo "${AVAILABLE_TEMPLATES}"
       ;;
-   *)
-      # for generate and generate-csr and everything else really
 
-      # if everything was successful, display information below
-      #if test ${failed} -eq 0;
-      #then
-         echo "workdir: ${CERTREQ_WORKDIR}"
-         echo "logfile: ${logfile}"
-         echo "certificate: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
-         echo "key: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key"
-         echo "chain: ${CERTREQ_WORKDIR}/${CHAIN_FILE}"
-      #fi
-      clean_certreq
-      exit "${failed:-0}"
+   request)
+      echo "workdir: ${CERTREQ_WORKDIR}"
+      echo "logfile: ${logfile}"
+      echo "csr: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.csr"
+      echo "key: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key"
+      echo "reqid: ${REQUESTID}"
+      ;;
+
+   fetch)
+      echo "workdir: ${CERTREQ_WORKDIR}"
+      echo "logfile: ${logfile}"
+      echo "certificate: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
+      ! fistruthy "${CERTREQ_SKIP_CACERTS}" && echo "chain: ${CERTREQ_WORKDIR}/${CHAIN_FILE}"
+      ;;
+
+   generate*)
+      # for generate and generate-csr and everything else really
+      echo "workdir: ${CERTREQ_WORKDIR}"
+      echo "logfile: ${logfile}"
+      echo "csr: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
+      echo "certificate: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.crt"
+      echo "key: ${CERTREQ_WORKDIR}/${CERTREQ_CNPARAM}.key"
+      ! fistruthy "${CERTREQ_SKIP_CACERTS}" && echo "chain: ${CERTREQ_WORKDIR}/${CHAIN_FILE}"
+
       ;;
 
 esac
+
+clean_certreq
+exit "${failed:-0}"
 
 # EMAIL LOGFILE
 #${sendsh} ${sendopts} "${server} ${scriptfile} out" ${logfile} ${interestedparties}
